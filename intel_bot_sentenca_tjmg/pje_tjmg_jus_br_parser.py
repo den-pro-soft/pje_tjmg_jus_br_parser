@@ -3,18 +3,20 @@ import sys
 
 # reload(sys)
 # sys.setdefaultencoding('utf8')
-
+import re
 import time
 import logging
+import urllib3
 import unicodedata
+import pdfkit
+import requests
 
+from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.support.select import Select
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
-import pdfkit
-import requests
 
 
 LOGIN_URL = 'https://pje.tjmg.jus.br/pje/login.seam'
@@ -25,6 +27,12 @@ logging.basicConfig(
     filemode='w+',
     format='%(name)s - %(levelname)s - %(message)s'
 )
+
+urllib3.disable_warnings()
+
+headers = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/72.0.3626.121 Safari/537.36',
+}
 
 
 class Bot(object):
@@ -56,8 +64,8 @@ class Bot(object):
             options=options,
             executable_path='geckodriver'
         )
-        driver.set_page_load_timeout(15)
-        driver.implicitly_wait(15)
+        driver.set_page_load_timeout(30)
+        driver.implicitly_wait(30)
         driver.set_window_size(1360, 900)
 
         return driver
@@ -122,11 +130,28 @@ class Bot(object):
     def switch_to_window(self, window_id):
         self.driver.switch_to.window(self.driver.window_handles[window_id])
 
+    def parse_to_json(self, data):
+        filter_dict = {}
+
+        try:
+            request_data = re.search(
+                                "'parameters':(.*?) } \)", 
+                                data) \
+                             .group(1) \
+                             .split(',')
+            
+            for item in request_data:
+                filter_dict[re.search("'(.*?)'", item).group(1)] = re.search("':(.*?)$", item) \
+                                                                     .group(1) \
+                                                                     .replace("'", "") \
+                                                                     .replace('}', '')
+        except:
+            pass
+        return filter_dict
+
     def parse(self, number, search_words):
-        import pdb;
-        pdb.set_trace()
         self.driver.get(LOGIN_URL)
-        time.slee(3)
+        time.sleep(5)
         self.driver.delete_all_cookies()
         self.driver.add_cookie({
             'name': self.session.cookies.keys()[0], 
@@ -134,14 +159,122 @@ class Bot(object):
         })
         self.get_search_page()
         try:
-            if SEARCH_PAGE != self.driver.current_url:
-                logging.warning('Error login. Please check your session.')
-                return None
+            search_page = self.session.get(SEARCH_PAGE, headers=headers, verify=False)
 
         except Exception:
-            logging.warning('Error login. Please check your session.')
-            return None
+            raise Exception('Connection aborted. Line: 125.')
 
+        soup = BeautifulSoup(search_page.content, 'html.parser')
+        view_state = soup.find(id='javax.faces.ViewState')
+
+        get_data = soup.find(id='fPP:searchProcessosPeticao')
+        filter_dict = self.parse_to_json(get_data['onclick'])
+        number_list = []
+
+        number_list.append(number.split('-')[0])
+        number_list += number.split('-')[1].split('.')
+
+        data = {
+            'AJAXREQUEST': '_viewRoot',
+            'fPP:numeroProcesso:numeroSequencial': number_list[0],
+            'fPP:numeroProcesso:numeroDigitoVerificador': number_list[1],
+            'fPP:numeroProcesso:Ano': number_list[2],
+            'fPP:numeroProcesso:labelJusticaFederal': number_list[3],
+            'fPP:numeroProcesso:labelTribunalRespectivo': number_list[4],
+            'fPP:numeroProcesso:NumeroOrgaoJustica': number_list[5],
+            'fPP': 'fPP', 
+            'autoScroll': '',
+            'fPP:searchProcessosPeticao': 'fPP:searchProcessosPeticao',
+            'javax.faces.ViewState': view_state.get('value'), 
+            'AJAX:EVENTS_COUNT': 1
+        }
+        data.update(filter_dict)
+
+        try:
+            response_search = self.session.post(SEARCH_PAGE, data=data, headers=headers, verify=False)
+        except Exception:
+            raise Exception('Connection aborted. Line: 171.')
+
+        soup = BeautifulSoup(response_search.content, 'html.parser')
+        view_state = soup.find(id='javax.faces.ViewState')
+
+        try:
+            get_table_search_number = soup.find(id='fPP:processosTable:tb')
+
+        except Exception:
+            raise Exception('Search number was not found. Line: 178.')
+
+        try:
+            second_a_content = get_table_search_number \
+                                .find_all('tr')[0] \
+                                .find_all('a')[1]['onclick']
+        except Exception:
+            raise Exception('Search number was not found. Line: 183.')
+
+
+        filter_dict = self.parse_to_json(second_a_content)
+        filter_dict['javax.faces.ViewState'] = view_state.get('value')
+
+        data.update(filter_dict)
+
+        try:
+            response_click = self.session.post(SEARCH_PAGE, data=data, headers=headers, verify=False)
+        except Exception:
+            raise Exception('Connection aborted. Line: 171.')
+
+        soup = BeautifulSoup(response_click.content, 'html.parser')
+
+        first_string = re.search('var link=(.*?);', soup.text.strip()) \
+                         .group(1) \
+                         .strip() \
+                         .replace('"', '') \
+                         .replace(' ', '') \
+                         .replace('+', '')
+        second_string = re.search('link \+= (.*?);', soup.text.strip()) \
+                          .group(1) \
+                          .replace('"', '')
+        peticionar_url = first_string + second_string
+
+        try:
+            response_peticionar = self.session.get(peticionar_url)
+        except Exception:
+            raise Exception('Connection aborted. Line: 241.')
+
+        soup = BeautifulSoup(response_peticionar.content, 'html.parser')
+        view_state = soup.find(id='javax.faces.ViewState')
+
+        try:
+            select_cb = soup.find(id='cbTDDecoration:cbTD')['onchange']
+
+        except Exception:
+            raise Exception('Search number was not found. Line: 249.')
+
+        filter_dict = self.parse_to_json(select_cb)
+
+        filter_dict['AJAXREQUEST'] = data['AJAXREQUEST']
+        filter_dict['ipDescDecoration:ipDesc'] = 'Petição'
+        filter_dict['javax.faces.ViewState'] = view_state['value']
+        filter_dict['cbTDDecoration:cbTD'] = 13
+        filter_dict['AJAX:EVENTS_COUNT'] = 1
+        filter_dict['ipNroDecoration:ipNro'] = ''
+        filter_dict['docPrincipalEditorTextArea'] = '<p>peticao area</p>'
+        filter_dict['context'] = '/pje'
+        filter_dict['mimes'] = 'application/pdf'
+        filter_dict['mimesEhSizes'] = 'application/pdf:3.0'
+        filter_dict['modalConfirmaLimparOpenedState'] = ''
+        filter_dict['modalErrosOpenedState'] = ''
+        filter_dict['quantidadeProcessoDocumento'] = 0
+
+        try:
+            save_peticao = self.session.post(
+                peticionar_url, 
+                data = filter_dict, 
+                headers = headers, 
+                verify = False)
+        except Exception:
+            raise Exception('Connection aborted. Line: 256.')
+
+        soup = BeautifulSoup(save_peticao.content, 'html.parser')
         #Not implemented yet....
 
     def generate_pdf(self, content):
@@ -179,6 +312,5 @@ class HeadlessPdfKit(pdfkit.PDFKit):
 if __name__ == '__main__':
     b = Bot(digital_user='admin', digital_password='123098skd123!98S_')
     search_words = [u"Sentença"]
-    b.parse('1000665-82.2016.5.02.0381', search_words)
-    b.parse('0010059-02.2015.5.01.0541', search_words)
+    b.parse('5101476-91.2017.8.13.0024', search_words)
     b.driver.quit()
